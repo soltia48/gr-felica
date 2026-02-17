@@ -1,0 +1,76 @@
+id: felica_iq_to_pdu
+label: FeliCa IQ to PDU
+category: '[felica]'
+
+templates:
+  imports: import felica
+  make: felica.iq_to_pdu(${sample_rate}, ${bitrate}, ${check_crc}, ${min_contrast}, ${include_len_byte}, ${use_agc}, ${agc_tau_bits})
+
+parameters:
+- id: sample_rate
+  label: Sample Rate
+  dtype: real
+  default: 6.78e6
+- id: bitrate
+  label: Bitrate
+  dtype: int
+  default: 212000
+- id: check_crc
+  label: Check CRC
+  dtype: bool
+  default: 'True'
+- id: min_contrast
+  label: Min Contrast
+  dtype: real
+  default: 0.08
+- id: include_len_byte
+  label: Include LEN in PDU
+  dtype: bool
+  default: 'False'
+- id: use_agc
+  label: Use AGC Frontend
+  dtype: bool
+  default: 'True'
+- id: agc_tau_bits
+  label: AGC Tau (bits)
+  dtype: real
+  default: 64.0
+
+inputs:
+- label: in
+  domain: stream
+  dtype: complex
+
+outputs:
+- label: pdu
+  domain: message
+  id: pdu
+
+asserts:
+- ${ sample_rate > 0 }
+- ${ bitrate > 0 }
+- ${ agc_tau_bits > 0 }
+
+documentation: |-
+  FeliCa physical-layer frame demodulation block based on JIS X 6319-4:2016.
+
+  Implementation:
+  - Demodulates Manchester-coded bits from the I/Q envelope
+  - Detects preamble (6 bytes of 0x00) + sync code (B24D)
+  - Converts the information field (LEN + data) into bytes
+  - Verifies CRC16 (x^16 + x^12 + x^5 + 1, initial value 0) (optional)
+  - Outputs payload as a PDU
+  - Optionally applies frontend AGC normalization to relatively emphasize weak load modulation
+
+  PDU:
+  - By default, outputs only the data part (without the leading LEN byte in the information field)
+  - If include_len_byte=True, LEN is included in the output
+
+  Metadata:
+  - len, sync0, sync1, crc_ok, crc_calc, crc_rx, inverted, start_sample, span_samples
+
+  Debug hints:
+  - If the PICC response is weak, try Use AGC Frontend=True and AGC Tau(bits)=32~128
+  - First inspect candidate frames with check_crc=False, then enable CRC checking
+
+file_format: 1
