@@ -6,7 +6,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <limits>
 #include <stdexcept>
 
 namespace gr {
@@ -28,9 +27,9 @@ iq_to_pdu_impl::iq_to_pdu_impl(float sample_rate, int bitrate, bool check_crc,
       d_sample_rate(sample_rate), d_bitrate(bitrate), d_check_crc(check_crc),
       d_min_contrast(min_contrast), d_include_len_byte(include_len_byte),
       d_use_agc(use_agc), d_agc_tau_bits(agc_tau_bits), d_spb(0), d_hb(0),
-      d_agc_alpha(0.0), d_agc_state(0.0), d_phase_steps(4),
-      d_min_frame_samples(0), d_max_frame_samples(0), d_search_pos(0),
-      d_env_start_index(0), d_last_published_end(-1.0) {
+      d_inv_hb(0), d_agc_alpha(0.0), d_agc_state(0.0), d_phase_steps(4),
+      d_min_frame_samples(0), d_max_frame_samples(0), d_env(), d_prefix(1, 0.0),
+      d_search_pos(0), d_env_start_index(0), d_last_published_end(-1.0) {
   if (d_sample_rate <= 0.0f) {
     throw std::invalid_argument("sample_rate must be > 0");
   }
@@ -46,6 +45,12 @@ iq_to_pdu_impl::iq_to_pdu_impl(float sample_rate, int bitrate, bool check_crc,
 
   d_spb = spb_est;
   d_hb = d_spb / 2;
+  d_inv_hb = 1.0 / d_hb;
+  // Low oversampling (e.g. 500 kS/s at 212 kb/s) does not benefit from
+  // a dense phase sweep; cut it to reduce per-candidate work.
+  if (d_spb <= 3.0) {
+    d_phase_steps = 2;
+  }
 
   if (d_agc_tau_bits <= 0.0f) {
     throw std::invalid_argument("agc_tau_bits must be > 0");
@@ -73,7 +78,6 @@ int iq_to_pdu_impl::general_work(int, gr_vector_int &ninput_items,
   const int ninput = ninput_items[0];
 
   if (ninput > 0) {
-    d_env.reserve(d_env.size() + static_cast<std::size_t>(ninput));
     for (int i = 0; i < ninput; ++i) {
       const double env = static_cast<double>(std::abs(in[i]));
       double v = env;
@@ -84,7 +88,9 @@ int iq_to_pdu_impl::general_work(int, gr_vector_int &ninput_items,
         d_agc_state += d_agc_alpha * (env - d_agc_state);
         v = env / std::max(d_agc_state, 1.0e-9);
       }
-      d_env.push_back(static_cast<float>(v));
+      const auto sample = static_cast<float>(v);
+      d_env.push_back(sample);
+      d_prefix.push_back(d_prefix.back() + static_cast<double>(sample));
     }
 
     process_buffer();
@@ -94,44 +100,33 @@ int iq_to_pdu_impl::general_work(int, gr_vector_int &ninput_items,
   return 0;
 }
 
-double iq_to_pdu_impl::cumulative_at(const std::vector<double> &prefix,
-                                     double x) const {
-  const double n = static_cast<double>(prefix.size() - 1);
+double iq_to_pdu_impl::cumulative_at(double x) const {
+  const double n = static_cast<double>(d_prefix.size() - 1);
   if (x <= 0.0) {
-    return 0.0;
+    return d_prefix.front();
   }
   if (x >= n) {
-    return prefix.back();
+    return d_prefix.back();
   }
 
   const auto i = static_cast<std::size_t>(std::floor(x));
   const double frac = x - static_cast<double>(i);
-  const double a = prefix[i];
-  const double b = prefix[i + 1];
+  const double a = d_prefix[i];
+  const double b = d_prefix[i + 1];
   return a + frac * (b - a);
 }
 
-double iq_to_pdu_impl::halfbit_mean(double start, std::size_t half_idx,
-                                    const std::vector<double> &prefix) const {
+double iq_to_pdu_impl::halfbit_mean(double start, std::size_t half_idx) const {
   const double seg_start = start + static_cast<double>(half_idx) * d_hb;
   const double seg_end = seg_start + d_hb;
-  if (seg_start < 0.0 || seg_end > static_cast<double>(prefix.size() - 1) ||
-      seg_end <= seg_start) {
-    return std::numeric_limits<double>::quiet_NaN();
-  }
-  const double sum =
-      cumulative_at(prefix, seg_end) - cumulative_at(prefix, seg_start);
-  return sum / d_hb;
+  const double sum = cumulative_at(seg_end) - cumulative_at(seg_start);
+  return sum * d_inv_hb;
 }
 
 bool iq_to_pdu_impl::decode_bit(double start, std::size_t bit_idx,
-                                const std::vector<double> &prefix,
                                 double margin, bool invert, int &bit) const {
-  const double first = halfbit_mean(start, bit_idx * 2, prefix);
-  const double second = halfbit_mean(start, bit_idx * 2 + 1, prefix);
-  if (!std::isfinite(first) || !std::isfinite(second)) {
-    return false;
-  }
+  const double first = halfbit_mean(start, bit_idx * 2);
+  const double second = halfbit_mean(start, bit_idx * 2 + 1);
 
   const double delta = first - second;
   if (std::abs(delta) < margin) {
@@ -147,13 +142,12 @@ bool iq_to_pdu_impl::decode_bit(double start, std::size_t bit_idx,
 }
 
 bool iq_to_pdu_impl::decode_byte(double start, std::size_t bit_idx,
-                                 const std::vector<double> &prefix,
                                  double margin, bool invert,
                                  uint8_t &out) const {
   uint8_t value = 0;
   for (std::size_t i = 0; i < 8; ++i) {
     int bit = 0;
-    if (!decode_bit(start, bit_idx + i, prefix, margin, invert, bit)) {
+    if (!decode_bit(start, bit_idx + i, margin, invert, bit)) {
       return false;
     }
     value = static_cast<uint8_t>((value << 1) | static_cast<uint8_t>(bit));
@@ -177,15 +171,14 @@ uint16_t iq_to_pdu_impl::crc16_ccitt_msb(const std::vector<uint8_t> &bytes) {
   return crc;
 }
 
-bool iq_to_pdu_impl::try_decode_frame(std::size_t start_index,
-                                      const std::vector<double> &prefix,
-                                      frame_t &frame,
+bool iq_to_pdu_impl::try_decode_frame(std::size_t start_index, frame_t &frame,
                                       double &frame_samples) const {
   if ((start_index + d_min_frame_samples) > d_env.size()) {
     return false;
   }
 
   constexpr std::size_t preamble_bits = 48;
+  double preamble_deltas[preamble_bits];
 
   for (std::size_t phase_idx = 0; phase_idx < d_phase_steps; ++phase_idx) {
     const double phase = (static_cast<double>(phase_idx) * d_hb) /
@@ -201,18 +194,13 @@ bool iq_to_pdu_impl::try_decode_frame(std::size_t start_index,
     double delta_sum = 0.0;
 
     for (std::size_t bit = 0; bit < preamble_bits; ++bit) {
-      const double first = halfbit_mean(start, bit * 2, prefix);
-      const double second = halfbit_mean(start, bit * 2 + 1, prefix);
-      if (!std::isfinite(first) || !std::isfinite(second)) {
-        first_sum = std::numeric_limits<double>::quiet_NaN();
-        break;
-      }
+      const double first = halfbit_mean(start, bit * 2);
+      const double second = halfbit_mean(start, bit * 2 + 1);
+      const double delta = first - second;
       first_sum += first;
       second_sum += second;
-      delta_sum += (first - second);
-    }
-    if (!std::isfinite(first_sum)) {
-      continue;
+      delta_sum += delta;
+      preamble_deltas[bit] = delta;
     }
 
     const double first_avg = first_sum / static_cast<double>(preamble_bits);
@@ -237,13 +225,22 @@ bool iq_to_pdu_impl::try_decode_frame(std::size_t start_index,
 
     std::size_t zero_count = 0;
     for (std::size_t bit = 0; bit < preamble_bits; ++bit) {
-      int value = 0;
-      if (!decode_bit(start, bit, prefix, margin, invert, value)) {
+      const double delta = preamble_deltas[bit];
+      if (std::abs(delta) < margin) {
         zero_count = 0;
         break;
       }
+      int value = (delta > 0.0) ? 1 : 0;
+      if (invert) {
+        value = 1 - value;
+      }
       if (value == 0) {
         ++zero_count;
+      }
+      const std::size_t remaining = preamble_bits - (bit + 1);
+      if ((zero_count + remaining) < 44) {
+        zero_count = 0;
+        break;
       }
     }
     if (zero_count < 44) {
@@ -252,10 +249,10 @@ bool iq_to_pdu_impl::try_decode_frame(std::size_t start_index,
 
     uint8_t sync0 = 0;
     uint8_t sync1 = 0;
-    if (!decode_byte(start, 48, prefix, margin, invert, sync0)) {
+    if (!decode_byte(start, 48, margin, invert, sync0)) {
       continue;
     }
-    if (!decode_byte(start, 56, prefix, margin, invert, sync1)) {
+    if (!decode_byte(start, 56, margin, invert, sync1)) {
       continue;
     }
 
@@ -266,7 +263,7 @@ bool iq_to_pdu_impl::try_decode_frame(std::size_t start_index,
     }
 
     uint8_t len = 0;
-    if (!decode_byte(start, 64, prefix, margin, invert, len)) {
+    if (!decode_byte(start, 64, margin, invert, len)) {
       continue;
     }
     if (len == 0) {
@@ -282,7 +279,7 @@ bool iq_to_pdu_impl::try_decode_frame(std::size_t start_index,
 
     std::vector<uint8_t> info(len);
     for (std::size_t i = 0; i < info.size(); ++i) {
-      if (!decode_byte(start, 64 + i * 8, prefix, margin, invert, info[i])) {
+      if (!decode_byte(start, 64 + i * 8, margin, invert, info[i])) {
         info.clear();
         break;
       }
@@ -293,12 +290,12 @@ bool iq_to_pdu_impl::try_decode_frame(std::size_t start_index,
 
     uint8_t crc0 = 0;
     uint8_t crc1 = 0;
-    if (!decode_byte(start, 64 + static_cast<std::size_t>(len) * 8, prefix,
-                     margin, invert, crc0)) {
+    if (!decode_byte(start, 64 + static_cast<std::size_t>(len) * 8, margin,
+                     invert, crc0)) {
       continue;
     }
-    if (!decode_byte(start, 72 + static_cast<std::size_t>(len) * 8, prefix,
-                     margin, invert, crc1)) {
+    if (!decode_byte(start, 72 + static_cast<std::size_t>(len) * 8, margin,
+                     invert, crc1)) {
       continue;
     }
 
@@ -376,17 +373,12 @@ void iq_to_pdu_impl::process_buffer() {
     d_search_pos = 0;
   }
 
-  std::vector<double> prefix(d_env.size() + 1, 0.0);
-  for (std::size_t i = 0; i < d_env.size(); ++i) {
-    prefix[i + 1] = prefix[i] + static_cast<double>(d_env[i]);
-  }
-
   std::size_t i = d_search_pos;
   while ((i + d_min_frame_samples) <= d_env.size()) {
     frame_t frame;
     double frame_samples = 0.0;
 
-    if (try_decode_frame(i, prefix, frame, frame_samples)) {
+    if (try_decode_frame(i, frame, frame_samples)) {
       frame.start_sample += static_cast<double>(d_env_start_index);
       const double frame_end = frame.start_sample + frame.span_samples;
       const bool overlaps_prev =
@@ -410,6 +402,8 @@ void iq_to_pdu_impl::process_buffer() {
     const std::size_t drop = d_search_pos - d_max_frame_samples;
     d_env.erase(d_env.begin(),
                 d_env.begin() + static_cast<std::ptrdiff_t>(drop));
+    d_prefix.erase(d_prefix.begin(),
+                   d_prefix.begin() + static_cast<std::ptrdiff_t>(drop));
     d_search_pos -= drop;
     d_env_start_index += static_cast<std::uint64_t>(drop);
   }

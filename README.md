@@ -9,6 +9,13 @@ cmake -S . -B build
 cmake --build build -j
 ```
 
+For performance-sensitive runs (e.g. real-time decode), prefer:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+```
+
 ## Install
 
 ```bash
@@ -26,5 +33,6 @@ cmake --install build
 - Expected bitrate is `212000` or `424000`
 - `sample_rate` must match the actual sample rate of the input stream
 - `sample_rate / bitrate >= 2` is required
+- At `500000` S/s input, use `bitrate=212000` (`424000` does not satisfy `sample_rate/bitrate >= 2`)
 - Payload command/response parsing is not performed; output is emitted as raw bytes in a PDU
 - Metadata such as `crc_ok`, `start_sample`, and `span_samples` is attached

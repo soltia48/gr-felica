@@ -50,6 +50,7 @@ private:
 
   double d_spb;
   double d_hb;
+  double d_inv_hb;
   double d_agc_alpha;
   double d_agc_state;
   std::size_t d_phase_steps;
@@ -57,28 +58,25 @@ private:
   std::size_t d_max_frame_samples;
 
   std::vector<float> d_env;
+  std::vector<double> d_prefix;
   std::size_t d_search_pos;
   std::uint64_t d_env_start_index;
   double d_last_published_end;
 
   void process_buffer();
 
-  bool try_decode_frame(std::size_t start_index,
-                        const std::vector<double> &prefix, frame_t &frame,
+  bool try_decode_frame(std::size_t start_index, frame_t &frame,
                         double &frame_samples) const;
 
-  bool decode_bit(double start, std::size_t bit_idx,
-                  const std::vector<double> &prefix, double margin, bool invert,
+  bool decode_bit(double start, std::size_t bit_idx, double margin, bool invert,
                   int &bit) const;
 
-  bool decode_byte(double start, std::size_t bit_idx,
-                   const std::vector<double> &prefix, double margin,
+  bool decode_byte(double start, std::size_t bit_idx, double margin,
                    bool invert, uint8_t &out) const;
 
-  double halfbit_mean(double start, std::size_t half_idx,
-                      const std::vector<double> &prefix) const;
+  double halfbit_mean(double start, std::size_t half_idx) const;
 
-  double cumulative_at(const std::vector<double> &prefix, double x) const;
+  double cumulative_at(double x) const;
 
   static uint16_t crc16_ccitt_msb(const std::vector<uint8_t> &bytes);
 
